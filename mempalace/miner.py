@@ -1323,7 +1323,12 @@ def _cleanup_mine_pid_file() -> None:
         if not pid_file.exists():
             return
         recorded = pid_file.read_text().strip()
-        if recorded and recorded.isdigit() and int(recorded) == os.getpid():
+        # PID file format: "{pid} {unix_timestamp}" (timestamp added in
+        # #1552 for stale-by-age detection).  Old-format files (bare
+        # "{pid}") are also handled: split on whitespace and take the
+        # first token as the PID.
+        pid_token = recorded.split()[0] if recorded else ""
+        if pid_token and pid_token.isdigit() and int(pid_token) == os.getpid():
             pid_file.unlink()
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.

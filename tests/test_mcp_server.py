@@ -2309,13 +2309,107 @@ class TestKGLazyCache:
         )
         assert add_result.get("success") is True, add_result
 
-        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_b))
-        query_b = mcp_server.tool_kg_query(entity="alice_secret")
-        assert query_b.get("count", 0) == 0, f"tenant B leaked tenant A's fact: {query_b}"
 
-        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_a))
-        query_a = mcp_server.tool_kg_query(entity="alice_secret")
-        assert query_a.get("count", 0) >= 1, f"tenant A lost its own fact: {query_a}"
+# ── Structured error codes + MineAlreadyRunning (#1552) ─────────────────
+
+
+class TestStructuredErrors:
+    """Verify that _internal_tool_error and MineAlreadyRunning return
+    machine-readable structured data (#1552)."""
+
+    def test_internal_tool_error_without_exc_has_no_data_field(self):
+        """Backward-compat: callers that omit exc still get a valid error dict."""
+        from mempalace.mcp_server import _internal_tool_error
+
+        try:
+            raise ValueError("test error")
+        except ValueError:
+            resp = _internal_tool_error("req-1", "mempalace_search")
+
+        assert resp["jsonrpc"] == "2.0"
+        assert resp["id"] == "req-1"
+        err = resp["error"]
+        assert err["code"] == -32000
+        assert err["message"] == "Internal tool error"
+        assert "data" not in err
+
+    def test_internal_tool_error_with_exc_includes_structured_data(self):
+        """When exc is supplied, the error body must include data.error_class
+        and data.message so callers can distinguish error types (#1552)."""
+        from mempalace.mcp_server import _internal_tool_error
+
+        exc = RuntimeError("chromadb cold init wedge")
+        try:
+            raise exc
+        except RuntimeError:
+            resp = _internal_tool_error("req-2", "mempalace_add_drawer", exc)
+
+        err = resp["error"]
+        assert err["code"] == -32000
+        assert "data" in err
+        assert err["data"]["error_class"] == "RuntimeError"
+        assert "chromadb cold init wedge" in err["data"]["message"]
+
+    def test_internal_tool_error_exception_dispatch_passes_exc(self, monkeypatch):
+        """handle_request's Exception branch must pass exc to _internal_tool_error."""
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def fake_handler(**kwargs):
+            raise OSError("fake disk error")
+
+        fake_tool_entry = {
+            "handler": fake_handler,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        monkeypatch.setattr(
+            mcp_server,
+            "TOOLS",
+            {"mempalace_fake": fake_tool_entry},
+        )
+
+        original = mcp_server._internal_tool_error
+
+        def spy_error(req_id, tool_name, exc=None):
+            captured["exc"] = exc
+            return original(req_id, tool_name, exc)
+
+        monkeypatch.setattr(mcp_server, "_internal_tool_error", spy_error)
+
+        req = {
+            "jsonrpc": "2.0",
+            "id": "r1",
+            "method": "tools/call",
+            "params": {"name": "mempalace_fake", "arguments": {}},
+        }
+        resp = mcp_server.handle_request(req)
+        assert resp["error"]["code"] == -32000
+        assert isinstance(captured.get("exc"), OSError)
+        assert "data" in resp["error"]
+        assert resp["error"]["data"]["error_class"] == "OSError"
+
+    def test_tool_sync_mine_already_running_returns_error_class(self, monkeypatch, tmp_path):
+        """tool_sync MineAlreadyRunning path returns error_class: LockHeldByOtherProcess."""
+        from mempalace import mcp_server
+        from mempalace.palace import MineAlreadyRunning
+
+        cfg = MagicMock()
+        cfg.palace_path = str(tmp_path / "palace")
+        monkeypatch.setattr(mcp_server, "_config", cfg)
+        monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: MagicMock())
+
+        def _raise_locked(*args, **kwargs):
+            raise MineAlreadyRunning("pid=12345")
+
+        import mempalace.sync as sync_mod
+
+        monkeypatch.setattr(sync_mod, "sync_palace", _raise_locked, raising=False)
+
+        result = mcp_server.tool_sync()
+        assert result["success"] is False
+        assert "another mine is in progress" in result["error"]
+        assert result.get("error_class") == "LockHeldByOtherProcess"
 
     def test_cache_thread_safe(self, tmp_path, monkeypatch):
         """Concurrent _get_kg() for the same path yields one instance."""

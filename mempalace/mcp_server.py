@@ -176,6 +176,27 @@ _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
+# MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
+# Code sessions do not self-terminate, accumulating ChromaDB/HNSW file
+# handles on Windows.  When MEMPALACE_MCP_IDLE_HOURS is set (or defaults
+# to 8 h), a background daemon thread exits the process once no request
+# has been handled for that long.  Set to 0 to disable.
+_MCP_IDLE_HOURS_ENV = "MEMPALACE_MCP_IDLE_HOURS"
+_MCP_IDLE_HOURS_DEFAULT = 8.0
+_last_request_time: float = time.monotonic()
+
+
+def _mcp_idle_timeout_secs() -> float:
+    """Return the configured MCP idle timeout in seconds (0 = disabled)."""
+    raw = os.environ.get(_MCP_IDLE_HOURS_ENV, "")
+    if raw:
+        try:
+            hours = float(raw)
+            return max(0.0, hours) * 3600
+        except ValueError:
+            pass
+    return _MCP_IDLE_HOURS_DEFAULT * 3600
+
 
 def _resolve_kg_path() -> str:
     if _palace_flag_given:
@@ -1204,7 +1225,11 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
         # below, otherwise MineAlreadyRunning and ValueError fall into the
         # generic "sync failed" branch and break the structured-error tests.
         except MineAlreadyRunning as exc:
-            return {"success": False, "error": f"another mine is in progress: {exc}"}
+            return {
+                "success": False,
+                "error": f"another mine is in progress: {exc}",
+                "error_class": "LockHeldByOtherProcess",
+            }
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
         except Exception as exc:
@@ -2286,22 +2311,30 @@ SUPPORTED_PROTOCOL_VERSIONS = [
 ]
 
 
-def _internal_tool_error(req_id, tool_name: str) -> dict:
+def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> dict:
     logger.exception(f"Tool error in {tool_name}")
+    error: dict = {"code": -32000, "message": "Internal tool error"}
+    if exc is not None:
+        error["data"] = {
+            "error_class": type(exc).__name__,
+            "message": str(exc),
+        }
     return {
         "jsonrpc": "2.0",
         "id": req_id,
-        "error": {"code": -32000, "message": "Internal tool error"},
+        "error": error,
     }
 
 
 def handle_request(request):
+    global _last_request_time
     if not isinstance(request, dict):
         return {
             "jsonrpc": "2.0",
             "id": None,
             "error": {"code": -32600, "message": "Invalid Request"},
         }
+    _last_request_time = time.monotonic()
     method = request.get("method") or ""
     params = request.get("params") or {}
     req_id = request.get("id")
@@ -2449,9 +2482,9 @@ def handle_request(request):
                             "message": f"Missing required {word} {quoted} for tool {tool_name}",
                         },
                     }
-            return _internal_tool_error(req_id, tool_name)
-        except Exception:
-            return _internal_tool_error(req_id, tool_name)
+            return _internal_tool_error(req_id, tool_name, e)
+        except Exception as exc:
+            return _internal_tool_error(req_id, tool_name, exc)
 
     # Notifications (missing id) must never get a response
     if req_id is None:
@@ -2626,6 +2659,37 @@ def _maybe_eager_warmup_embedder() -> None:
         )
 
 
+def _start_idle_exit_watchdog() -> None:
+    """Start a daemon thread that exits the process after an idle period.
+
+    When no request has been handled for ``MEMPALACE_MCP_IDLE_HOURS``
+    (default 8 h), the thread calls ``sys.exit(0)`` so that stale MCP
+    servers from ended Claude Code sessions do not accumulate ChromaDB /
+    HNSW file handles on Windows (#1552).
+
+    Set ``MEMPALACE_MCP_IDLE_HOURS=0`` to disable the watchdog.
+    """
+    timeout = _mcp_idle_timeout_secs()
+    if timeout <= 0:
+        return
+    check_interval = min(60.0, timeout / 4)
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(check_interval)
+            idle = time.monotonic() - _last_request_time
+            if idle >= timeout:
+                logger.info(
+                    "MCP server idle for %.1f h (limit %.1f h); exiting to release file handles.",
+                    idle / 3600,
+                    timeout / 3600,
+                )
+                sys.exit(0)
+
+    t = threading.Thread(target=_watchdog, name="mcp-idle-watchdog", daemon=True)
+    t.start()
+
+
 def main():
     """MCP server entry point for the ``mempalace-mcp`` console script.
 
@@ -2661,6 +2725,9 @@ def main():
     # does not pay the ONNX/CoreML cold-load tax under the MCP client
     # timeout (#1495). Default off — preserves current startup latency.
     _maybe_eager_warmup_embedder()
+    # Idle auto-exit: release ChromaDB file handles from stale servers
+    # that outlived their Claude Code session (#1552).
+    _start_idle_exit_watchdog()
     while True:
         try:
             line = sys.stdin.readline()
