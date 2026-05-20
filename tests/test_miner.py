@@ -154,6 +154,100 @@ def test_mine_hallway_failure_does_not_crash_mine(monkeypatch):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_computes_entity_tunnels_for_wing_post_mine(monkeypatch):
+    """After mine() completes (non-dry-run), ``_compute_entity_tunnels_for_wing``
+    must be called once with the wing name from mempalace.yaml.
+
+    Without this call the entity-tunnel feature is dead code — no miner
+    triggers it, no entity tunnels ever land in ~/.mempalace/tunnels.json.
+    Mirrors the existing hallway- and topic-tunnel integration tests in
+    this file.
+    """
+    from mempalace import miner as miner_mod
+
+    entity_tunnel_calls = []
+
+    def fake_compute(wing):
+        entity_tunnel_calls.append({"wing": wing})
+        return 0  # no tunnels — that's not what we're testing here
+
+    # Patch at the call site (mempalace.miner._compute_entity_tunnels_for_wing)
+    # so the integration in mine() routes through our stub.
+    monkeypatch.setattr(miner_mod, "_compute_entity_tunnels_for_wing", fake_compute)
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        os.makedirs(project_root / "backend")
+        write_file(
+            project_root / "backend" / "app.py",
+            "def main():\n    print('hello world')\n" * 20,
+        )
+        with open(project_root / "mempalace.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "wing": "test_project",
+                    "rooms": [{"name": "backend", "description": "Backend code"}],
+                },
+                f,
+            )
+
+        palace_path = project_root / "palace"
+        mine(str(project_root), str(palace_path))
+
+        assert len(entity_tunnel_calls) == 1, (
+            f"expected _compute_entity_tunnels_for_wing to be called once, "
+            f"got {len(entity_tunnel_calls)}"
+        )
+        assert entity_tunnel_calls[0]["wing"] == "test_project"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_entity_tunnel_failure_does_not_crash_mine(monkeypatch):
+    """If ``_compute_entity_tunnels_for_wing`` raises, the mine must still
+    complete and the drawer write must remain committed.
+
+    Mirrors the try/except wrap around the existing tunnel- and hallway-
+    computation blocks. Entity tunnel computation is a derived analytic,
+    not load-bearing for the drawer write itself.
+    """
+    from mempalace import miner as miner_mod
+
+    def angry_compute(wing):
+        raise RuntimeError("simulated entity-tunnel-compute explosion")
+
+    monkeypatch.setattr(miner_mod, "_compute_entity_tunnels_for_wing", angry_compute)
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        os.makedirs(project_root / "backend")
+        write_file(
+            project_root / "backend" / "app.py",
+            "def main():\n    print('hello world')\n" * 20,
+        )
+        with open(project_root / "mempalace.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "wing": "test_project",
+                    "rooms": [{"name": "backend", "description": "Backend code"}],
+                },
+                f,
+            )
+
+        palace_path = project_root / "palace"
+        # Must NOT raise — the failure has to be caught + logged but not propagated.
+        mine(str(project_root), str(palace_path))
+
+        # Drawer-write side of the mine still committed.
+        client = chromadb.PersistentClient(path=str(palace_path))
+        col = client.get_collection("mempalace_drawers")
+        assert col.count() > 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_load_config_uses_defaults_when_yaml_missing():
     tmpdir = tempfile.mkdtemp()
     try:

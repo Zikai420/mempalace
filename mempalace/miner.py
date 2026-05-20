@@ -1269,6 +1269,22 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
+            # Cross-wing entity tunnels: derived from the hallway records
+            # materialized just above. When an entity appears in hallways of
+            # this wing AND another wing, a tunnel bridges them. Runs in
+            # parallel with topic tunnels — both kinds coexist via
+            # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
+            # pattern: never fail a mine over a derived analytic.
+            try:
+                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing)
+                if entity_tunnels_added:
+                    print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
+            except Exception as e:
+                print(
+                    f"\n  WARNING: entity tunnel computation skipped — {e}",
+                    file=sys.stderr,
+                )
+
         print(f"\n{'=' * 55}")
         print("  Done.")
         print(f"  Files processed: {len(files) - files_skipped}")
@@ -1367,6 +1383,31 @@ def _compute_topic_tunnels_for_wing(wing: str) -> int:
     cfg = MempalaceConfig()
     min_count = cfg.topic_tunnel_min_count
     created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count)
+    return len(created)
+
+
+def _compute_entity_tunnels_for_wing(wing: str) -> int:
+    """Drop tunnels between ``wing`` and every other wing that shares an
+    entity via the within-wing hallway primitive.
+
+    Reads hallway records (``mempalace.hallways.list_hallways``) and
+    materializes cross-wing tunnels for any entity that has hallways in
+    this wing AND at least one other wing. Tunnels use ``kind="entity"``
+    and the synthetic endpoint room ``entity:<name>`` so they're
+    distinguishable from explicit and topic tunnels at read time but
+    interchangeable with them via the standard ``list_tunnels`` /
+    ``follow_tunnels`` API.
+
+    Returns the number of tunnels created or refreshed. Zero means no
+    eligible entity exists in this wing yet (or no hallway records do).
+    """
+    from .hallways import list_hallways
+    from .palace_graph import entity_tunnels_for_wing
+
+    hallways = list_hallways()
+    if not hallways:
+        return 0
+    created = entity_tunnels_for_wing(wing, hallways)
     return len(created)
 
 
