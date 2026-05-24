@@ -19,10 +19,12 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .entity_detector import _get_coca_filter
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     MineValidationError,
+    _candidate_entity_words,
     _open_collection_or_explain,
     _validate_palace_fts5_after_mine,
     build_closet_lines,
@@ -866,9 +868,6 @@ def _extract_entities_for_metadata(content: str) -> str:
         # in chat transcripts and voice-typed content get silently untagged.
         if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content, re.IGNORECASE):
             matched.add(name)
-
-    from .entity_detector import _get_coca_filter
-    from .palace import _candidate_entity_words
 
     coca_filter = _get_coca_filter()
     window = content[:_ENTITY_EXTRACT_WINDOW]

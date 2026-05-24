@@ -15,6 +15,7 @@ from typing import Optional
 
 from .backends import BackendClosedError, CollectionNotInitializedError, PalaceNotFoundError
 from .backends.chroma import ChromaBackend
+from .entity_detector import _get_coca_filter
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -264,8 +265,6 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_meta
 
     # Extract proper nouns (2+ occurrences). Uses i18n-aware patterns so
     # non-Latin names (Cyrillic, accented Latin, etc.) are also detected.
-    from .entity_detector import _get_coca_filter
-
     coca_filter = _get_coca_filter()
     words = _candidate_entity_words(window)
     word_freq = {}
