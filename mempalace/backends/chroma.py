@@ -1059,6 +1059,12 @@ class ChromaCollection(BaseCollection):
             return None
         from ..config import strip_lone_surrogates
 
+        # chromadb accepts OneOrMany[Document]: a bare str is a single document,
+        # not an iterable of characters. Handle it explicitly so we don't split
+        # it into per-character documents — that would be exactly the kind of
+        # silent corruption this method exists to prevent.
+        if isinstance(documents, str):
+            return strip_lone_surrogates(documents)
         return [strip_lone_surrogates(d) if isinstance(d, str) else d for d in documents]
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):

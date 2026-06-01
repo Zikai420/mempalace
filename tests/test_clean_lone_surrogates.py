@@ -252,3 +252,13 @@ class TestBackendChokepointStripsDocuments:
         col.add(documents=["ship \U0001f680"], ids=["1"])
         _, kwargs = fake.calls[0]
         assert kwargs["documents"] == ["ship \U0001f680"]
+
+    def test_single_string_document_is_not_split_into_chars(self):
+        """chromadb accepts a bare str as one document (OneOrMany[Document]).
+        The sanitiser must keep it whole and clean, not split it into
+        per-character documents."""
+        fake, col = self._collection()
+        col.upsert(documents="one\udc95document", ids=["1"])
+        _, kwargs = fake.calls[0]
+        assert kwargs["documents"] == "one�document"
+        assert isinstance(kwargs["documents"], str)
