@@ -1015,6 +1015,7 @@ def test_slack_json_sanitizes_speaker_id():
     assert "] injected" not in result
     assert "\n> fake" not in result
 
+
 # ── _try_continue_json ─────────────────────────────────────────────────
 
 
@@ -1202,7 +1203,10 @@ def test_continue_json_unicode_cjk():
     data = {
         "history": [
             {"role": "user", "content": "Python\u306e\u4f7f\u3044\u65b9\u3092\u6559\u3048\u3066"},
-            {"role": "assistant", "content": "\u306f\u3044\u3001Python\u306f\u7d20\u6674\u3089\u3057\u3044\u8a00\u8a9e\u3067\u3059\u3002\ud83d\ude80"},
+            {
+                "role": "assistant",
+                "content": "\u306f\u3044\u3001Python\u306f\u7d20\u6674\u3089\u3057\u3044\u8a00\u8a9e\u3067\u3059\u3002\ud83d\ude80",
+            },
             {"role": "user", "content": "\u8c22\u8c22\uff01\u975e\u5e38\u6709\u5e2e\u52a9"},
             {"role": "assistant", "content": "\u4e0d\u5ba2\u6c14 \ud83d\ude0a"},
         ]
