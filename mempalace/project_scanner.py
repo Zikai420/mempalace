@@ -175,7 +175,7 @@ def _parse_pom(path: Path) -> Optional[str]:
     except (ET.ParseError, OSError):
         return None
     for child in root:
-        if _xml_local_name(child.tag) == "artifactId":
+        if isinstance(child.tag, str) and _xml_local_name(child.tag) == "artifactId":
             name = (child.text or "").strip()
             return name or None
     return None
@@ -526,10 +526,12 @@ def scan(root: str | os.PathLike) -> tuple[list[ProjectInfo], list[PersonInfo]]:
 
     for repo in repos:
         manifests = _collect_manifest_names(repo)
-        if manifests:
-            manifest_file, proj_name, _ = manifests[0]
+        root_manifest = next((entry for entry in manifests if entry[2] == repo), None)
+        if root_manifest:
+            manifest_file, proj_name, _ = root_manifest
         else:
             manifest_file, proj_name = None, repo.name
+        extra_manifests = [entry for entry in manifests if entry != root_manifest]
 
         authors = _git_authors(repo)
         non_bot_authors = [(name, email) for name, email in authors if not _is_bot(name, email)]
@@ -566,8 +568,13 @@ def scan(root: str | os.PathLike) -> tuple[list[ProjectInfo], list[PersonInfo]]:
         if existing is None or proj.user_commits > existing.user_commits:
             projects[proj_name] = proj
 
-        for extra_manifest, extra_name, extra_dir in manifests[1:]:
-            if extra_manifest not in JAVA_MANIFESTS or extra_name in projects:
+        for extra_manifest, extra_name, extra_dir in extra_manifests:
+            if extra_manifest not in JAVA_MANIFESTS:
+                continue
+            existing = projects.get(extra_name)
+            if existing is not None and (
+                existing.manifest is not None or existing.repo_root != repo
+            ):
                 continue
             projects[extra_name] = ProjectInfo(
                 name=extra_name,

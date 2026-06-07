@@ -112,6 +112,24 @@ def test_parse_pom_missing_or_malformed_artifact_id(tmp_path):
     assert _parse_pom(malformed) is None
 
 
+def test_parse_pom_ignores_non_string_child_tags(tmp_path, monkeypatch):
+    class FakeChild:
+        tag = object()
+        text = "ignored"
+
+    class ArtifactChild:
+        tag = "artifactId"
+        text = "safe-artifact"
+
+    class FakeTree:
+        def getroot(self):
+            return [FakeChild(), ArtifactChild()]
+
+    monkeypatch.setattr("mempalace.project_scanner.ET.parse", lambda _path: FakeTree())
+
+    assert _parse_pom(tmp_path / "pom.xml") == "safe-artifact"
+
+
 def test_parse_gradle_build_reads_sibling_settings(tmp_path):
     (tmp_path / "settings.gradle").write_text('rootProject.name = "settings-name"\n')
     f = tmp_path / "build.gradle"
@@ -406,6 +424,27 @@ def test_scan_includes_java_subprojects_inside_mixed_git_repo(tmp_path):
     assert by_name["java-service"].repo_root == service
     assert by_name["worker"].manifest == "build.gradle.kts"
     assert by_name["worker"].repo_root == worker
+
+
+def test_scan_git_repo_without_root_manifest_keeps_java_subproject_dir(tmp_path):
+    service = tmp_path / "service"
+    service.mkdir()
+    (service / "pom.xml").write_text(
+        """<project>
+  <modelVersion>4.0.0</modelVersion>
+  <artifactId>java-service</artifactId>
+</project>
+"""
+    )
+    _init_git_repo(tmp_path)
+
+    projects, _ = scan(tmp_path)
+    by_name = {p.name: p for p in projects}
+
+    assert by_name[tmp_path.name].manifest is None
+    assert by_name[tmp_path.name].repo_root == tmp_path
+    assert by_name["java-service"].manifest == "pom.xml"
+    assert by_name["java-service"].repo_root == service
 
 
 def test_scan_prefers_root_manifest_with_explicit_priority(tmp_path):
