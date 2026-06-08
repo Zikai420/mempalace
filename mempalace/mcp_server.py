@@ -74,7 +74,11 @@ from .backends.chroma import (  # noqa: E402
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
-from .searcher import search_memories  # noqa: E402
+from .searcher import (  # noqa: E402
+    _distance_to_similarity,
+    _metric_for_collection,
+    search_memories,
+)
 from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
@@ -1234,9 +1238,10 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         )
         duplicates = []
         if results["ids"] and results["ids"][0]:
+            metric = _metric_for_collection(col)
             for i, drawer_id in enumerate(results["ids"][0]):
                 dist = results["distances"][0][i]
-                similarity = round(max(0.0, 1 - dist), 3)
+                similarity = round(_distance_to_similarity(dist, metric), 3)
                 if similarity >= threshold:
                     # Chroma 1.5.x can return None for partially-flushed rows;
                     # coerce to empty sentinels so downstream .get() is safe.

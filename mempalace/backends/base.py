@@ -301,6 +301,17 @@ class BaseCollection(ABC):
     def health(self) -> HealthStatus:
         return HealthStatus.healthy()
 
+    @property
+    def distance_metric(self) -> str:
+        """The space this collection's ``distances`` are reported in.
+
+        Defaults to the owning backend's declared metric (cosine for all
+        in-tree backends). Collections that can vary per-collection — e.g. a
+        legacy Chroma palace built without ``hnsw:space=cosine`` — override
+        this to report their actual space so core ranking converts correctly.
+        """
+        return "cosine"
+
     def lexical_search(
         self,
         *,
@@ -381,6 +392,12 @@ class BaseBackend(ABC):
     name: ClassVar[str]
     spec_version: ClassVar[str] = "1.0"
     capabilities: ClassVar[frozenset[str]] = frozenset()
+    #: The space ``query()`` reports ``distances`` in (RFC 001 §2.1).
+    #: One of ``"cosine"`` | ``"l2"`` | ``"ip"``. The contract for the
+    #: ``distances`` field is *lower = closer* regardless of metric; core
+    #: search converts distance→similarity off this declaration rather than
+    #: assuming cosine. All in-tree backends are cosine today.
+    distance_metric: ClassVar[str] = "cosine"
 
     @abstractmethod
     def get_collection(

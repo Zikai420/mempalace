@@ -49,6 +49,14 @@ class EmbeddingCollection(BaseCollection):
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
+    @property
+    def distance_metric(self) -> str:
+        # Explicit delegation: ``BaseCollection`` defines ``distance_metric``
+        # as a property, so it resolves on this subclass and ``__getattr__``
+        # never fires — without this override the wrapper would report the
+        # base "cosine" default and mask a wrapped non-cosine backend.
+        return self._inner.distance_metric
+
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         documents = _as_list(documents)
         ids = _as_list(ids)
