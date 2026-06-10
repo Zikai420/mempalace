@@ -33,6 +33,13 @@ Where `<command>` is one of: `help`, `init`, `mine`, `search`, `status`.
 
 Run the appropriate instructions command, then follow the returned instructions step by step.
 
+## Recalling past work
+
+This skill covers setup, mining, and status. For questions about past
+work, prior decisions, or people that may already be filed in the
+palace, prefer the **`mempalace-recall`** skill — it enforces
+search-before-answer so the agent reads the palace instead of guessing.
+
 ## Cursor-specific notes
 
 - The `mempalace-mcp` server is auto-registered by this plugin. Once installed, all 19 MemPalace MCP tools (`mempalace_search`, `mempalace_add_drawer`, `mempalace_diary_write`, `mempalace_check_duplicate`, `mempalace_diary_read`, etc.) are available to the agent without any further configuration.

@@ -47,6 +47,7 @@ README_PATH = PLUGIN_DIR / "README.md"
 # directories at the plugin root; .cursor-plugin/ symlinks back to these.
 SKILLS_DIR = REPO_ROOT / "skills"
 COMMANDS_DIR = REPO_ROOT / "commands"
+RULES_DIR = REPO_ROOT / "rules"
 
 # The slugs we promise to ship. The README's "Available Slash Commands"
 # table is the user-facing contract; if you add/remove a command,
@@ -291,6 +292,13 @@ class TestSkills:
     def test_mempalace_skill_exists(self):
         assert (SKILLS_DIR / "mempalace" / "SKILL.md").is_file()
 
+    def test_mempalace_recall_skill_exists(self):
+        """The recall skill is the search-before-answer half of the
+        plugin (the ``mempalace`` skill covers setup/mine/status). If it
+        goes missing, recall silently regresses to model-memory guessing.
+        """
+        assert (SKILLS_DIR / "mempalace-recall" / "SKILL.md").is_file()
+
     def test_each_skill_has_valid_frontmatter(self):
         """Every SKILL.md must declare ``name`` (kebab-case) and a
         non-empty ``description``. Skills missing these fields silently
@@ -325,6 +333,66 @@ class TestSkills:
                 f"{skill_path.relative_to(REPO_ROOT)}: name={meta.get('name')!r} "
                 f"must match directory {dir_name!r}"
             )
+
+
+# ── rules/ ──────────────────────────────────────────────────────────
+
+
+class TestRules:
+    """The plugin ships an optional recall rule at the plugin root under
+    ``rules/``. Like skills and commands, rules are discovered from a
+    real directory at the plugin root (the repo root), not from inside
+    ``.cursor-plugin/``.
+    """
+
+    def test_rules_dir_exists(self):
+        assert RULES_DIR.is_dir(), "rules/ missing at repo root"
+
+    def test_rules_dir_is_real_not_symlink(self):
+        assert not RULES_DIR.is_symlink(), (
+            "rules/ must be a real directory, not a symlink — "
+            "Cursor does not follow symlinks for local-plugin discovery"
+        )
+
+    def test_recall_rule_exists(self):
+        assert (RULES_DIR / "mempalace-recall.mdc").is_file()
+
+    def test_each_rule_has_valid_frontmatter(self):
+        """Every ``.mdc`` rule must declare a non-empty ``description``
+        (Cursor's matcher reads it to decide relevance) and a boolean
+        ``alwaysApply``. A rule missing ``description`` never auto-applies.
+        """
+        rule_files = list(RULES_DIR.glob("*.mdc"))
+        assert rule_files, f"{RULES_DIR} must contain at least one .mdc rule"
+        for rule_path in rule_files:
+            text = rule_path.read_text(encoding="utf-8")
+            meta, body = _parse_frontmatter(text)
+            ctx = f"{rule_path.relative_to(REPO_ROOT)}"
+            assert meta, f"{ctx}: missing YAML frontmatter"
+            assert isinstance(meta.get("description"), str) and meta["description"], (
+                f"{ctx}: 'description' must be a non-empty string"
+            )
+            assert isinstance(meta.get("alwaysApply"), bool), (
+                f"{ctx}: 'alwaysApply' must be a boolean"
+            )
+            assert body.strip(), f"{ctx}: body must not be empty"
+
+    def test_shipped_recall_rule_is_not_always_apply(self):
+        """The plugin-shipped recall rule must be ``alwaysApply: false``.
+
+        An always-on rule loads on every turn in every workspace the
+        plugin touches, adding MCP latency to unrelated work and fighting
+        MemPalace's "memory should feel instant" budget. The aggressive
+        ``alwaysApply: true`` variant is an opt-in shipped only under
+        examples/, never wired into the default plugin bundle.
+        """
+        meta, _ = _parse_frontmatter(
+            (RULES_DIR / "mempalace-recall.mdc").read_text(encoding="utf-8")
+        )
+        assert meta.get("alwaysApply") is False, (
+            "the plugin-shipped recall rule must be alwaysApply: false; "
+            "the always-on variant belongs in examples/cursor/rules/"
+        )
 
 
 # ── commands/ ───────────────────────────────────────────────────────

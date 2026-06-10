@@ -21,6 +21,28 @@ system is configured per-user/per-project (in `~/.cursor/hooks.json`),
 not per-plugin.
 :::
 
+## Three layers of recall
+
+The `sessionStart` wake hook is one of three orthogonal ways MemPalace
+gets the agent to read the palace before answering. Install any
+combination — they reinforce each other and all reference the same
+canonical protocol in
+[`integrations/shared/recall-protocol.md`](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/recall-protocol.md).
+
+| Layer | Fires | Scope | Get it from |
+|-------|-------|-------|-------------|
+| **`sessionStart` hook** | Once per new conversation | Injects wing-scoped recall context up front | The hooks on this page |
+| **`mempalace-recall` skill** | When a request matches its description, or when attached | Full search-before-answer protocol | The [Cursor plugin](https://github.com/MemPalace/mempalace/blob/main/.cursor-plugin/README.md) (`skills/`) |
+| **Recall rule** | When Cursor's matcher judges the turn recall-relevant | A short nudge to search first | The plugin (`rules/mempalace-recall.mdc`, `alwaysApply: false`) or [`examples/cursor/rules/`](https://github.com/MemPalace/mempalace/blob/develop/examples/cursor/rules/README.md) |
+
+The hook is the only layer that fires *automatically and exactly once*
+per chat. The skill and rule are demand-driven: they kick in when the
+user actually asks about past work, people, or prior decisions, and stay
+out of the way on greenfield coding. For recall forced into every
+conversation, copy the `alwaysApply: true` variant from
+`examples/cursor/rules/` into `~/.cursor/rules/` — a heavier, deliberate
+opt-in.
+
 ## What They Do
 
 | Hook | When It Fires | What Happens |

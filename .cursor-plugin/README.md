@@ -1,6 +1,6 @@
 # MemPalace Cursor Plugin
 
-A Cursor IDE plugin that gives your agent a persistent memory system. Auto-registers the `mempalace-mcp` server (19 MCP tools), ships 5 slash commands, and provides one model-invocable skill that guides the agent through setup, mining, and search.
+A Cursor IDE plugin that gives your agent a persistent memory system. Auto-registers the `mempalace-mcp` server (19 MCP tools), ships 5 slash commands, two model-invocable skills (setup/mining/search and a recall protocol), and an optional recall rule.
 
 > Hooks (auto-save + session-start memory recall) are shipped separately under `hooks/cursor/` so the plugin is safe to install in any Cursor workspace without touching the agent loop. See [Hooks](#hooks-optional) below.
 
@@ -48,6 +48,30 @@ This installs the `mempalace` package via `uv tool` or `pip`, initializes a pala
 | `/mempalace-status` | Show palace overview — wings, rooms, drawer counts                                |
 
 > Cursor commands are global, not plugin-namespaced — that's why each slug is prefixed with `mempalace-` rather than appearing as `/help`, `/init`, etc. This keeps them collision-free with built-in or other-plugin commands.
+
+## Skills
+
+Two model-invocable skills ship at the plugin root under `skills/`:
+
+| Skill | What it does |
+|-------|--------------|
+| `mempalace` | Setup, mining, status, and the dynamic `mempalace instructions` CLI. |
+| `mempalace-recall` | Search-before-answer protocol — makes the agent read the palace before answering about past work, people, projects, or prior decisions instead of guessing. |
+
+Cursor surfaces these automatically when a request matches their description, or you can attach them explicitly.
+
+## Recall rule (optional)
+
+The plugin also ships a Cursor rule at the plugin root under `rules/mempalace-recall.mdc`:
+
+```yaml
+description: When the user asks about past work, prior decisions, people, ... call mempalace_search before answering ...
+alwaysApply: false
+```
+
+It is `alwaysApply: false` on purpose — Cursor loads it only when its matcher judges the turn recall-relevant, so it never fires on unrelated coding work and never adds MCP latency to greenfield tasks. The rule, the `mempalace-recall` skill, and the `sessionStart` hook all reference the same canonical protocol in [`integrations/shared/recall-protocol.md`](../integrations/shared/recall-protocol.md).
+
+Want recall forced into **every** conversation regardless of context? Copy the aggressive `alwaysApply: true` variant from [`examples/cursor/rules/`](../examples/cursor/rules/README.md) into `~/.cursor/rules/`. That is a deliberate, heavier opt-in, not a default.
 
 ## MCP Server
 
