@@ -40,6 +40,7 @@ def live(request, tmp_path):
     namespace = "conf_" + request.node.name.replace("[", "_").replace("]", "")[:40]
     backend = PgVectorBackend()
     created = []
+    created_lock = threading.Lock()
 
     def make(path, name="drawers", create=True, ns=namespace, dsn=LIVE_DSN, backend_=None):
         b = backend_ or backend
@@ -47,7 +48,10 @@ def live(request, tmp_path):
         col = b.get_collection(
             palace=ref, collection_name=name, create=create, options={"dsn": dsn, "namespace": ns}
         )
-        created.append(col)
+        # The concurrent tests call make() from worker threads; plain list
+        # append is not guaranteed safe on every Python build.
+        with created_lock:
+            created.append(col)
         return col
 
     yield backend, make, namespace
@@ -92,8 +96,9 @@ def test_live_add_query_filters_lexical_and_marker(live, tmp_path):
         where={"wing": "project"},
         include=["documents", "metadatas", "distances", "embeddings"],
     )
-    assert result.ids[0][0] == "a"
-    assert set(result.ids[0]) == {"a", "b", "c"}
+    # ORDER BY distance ASC is part of the query contract — assert the
+    # exact ranking, not just membership.
+    assert result.ids[0] == ["a", "b", "c"]
     assert result.embeddings[0][0] == pytest.approx([1.0, 0.0])
 
     hits = col.lexical_search(query="rareterm backend", n_results=2, where={"wing": "project"}).hits
@@ -147,7 +152,7 @@ def test_live_complex_filters_pushdown_vs_local_fallback(live, tmp_path):
     assert contains.ids == ["b"]
 
     ranked = col.query(query_embeddings=[[1, 0]], n_results=3, where={"rank": {"$gte": 2}})
-    assert set(ranked.ids[0]) == {"b", "c"}
+    assert ranked.ids[0] == ["b", "c"]
 
     eq_pushdown = col.get(where={"wing": "y"})
     assert eq_pushdown.ids == ["b"]
@@ -255,6 +260,12 @@ def test_live_concurrent_writers_distinct_connections(live, tmp_path):
 
     def writer(worker):
         backend = PgVectorBackend()
+        # The marker file is already written by the seed step. upsert()
+        # rewrites it on every call with a plain open("w"), so 8 backends
+        # sharing one local_path would race on the same file — a test-design
+        # artifact (and a known sharing-violation hazard on Windows), not
+        # the contract under test here. Stub it for the concurrent phase.
+        backend._write_marker = lambda *args, **kwargs: None
         try:
             col = make(tmp_path, backend_=backend)
             for i in range(25):
@@ -278,7 +289,7 @@ def test_live_concurrent_writers_distinct_connections(live, tmp_path):
 
 def test_live_reindex_advisory_lock_race(live, tmp_path):
     """Two connections racing run_maintenance('reindex') — the #1732
-    advisory-lock behavior: at most one 'ran', the loser learns
+    advisory-lock behavior: exactly one 'ran', the loser learns
     'already_running' (or 'noop' after the winner finishes), nobody stacks
     a second ACCESS EXCLUSIVE build and nobody raises."""
     _backend, make, ns = live
@@ -313,7 +324,9 @@ def test_live_reindex_advisory_lock_race(live, tmp_path):
         t.join(timeout=60)
 
     assert errors == [], f"reindex race raised: {errors}"
-    assert statuses.count("ran") <= 1
+    # The index does not exist beforehand, so exactly one racer must win
+    # the advisory lock and build it.
+    assert statuses.count("ran") == 1
     assert all(s in {"ran", "already_running", "noop"} for s in statuses), statuses
     state = col.maintenance_state()
     assert state["vector_index"] == "hnsw"
