@@ -543,14 +543,21 @@ class TestSearchMemoriesHybrid:
         ``closet_preview`` exposes the hydrated index line."""
         closets = get_closets_collection(palace_path)
         # Seed the closet against the same source_file the drawer uses so
-        # the boost lookup keys align.
-        closets.upsert(
-            ids=["closet_proj_backend_aaa_01"],
-            documents=["JWT auth tokens|;|→drawer_proj_backend_aaa"],
-            metadatas=[{"wing": "project", "room": "backend", "source_file": "auth.py"}],
+        # the boost lookup keys align. Use several high-signal closet lines
+        # instead of one terse pointer so the ranking is stable across Chroma
+        # platform builds.
+        upsert_closet_lines(
+            closets,
+            closet_id_base="closet_proj_backend_aaa",
+            lines=[
+                "JWT auth tokens|;|→drawer_proj_backend_aaa",
+                "session expiry authentication module|;|→drawer_proj_backend_aaa",
+                "HttpOnly refresh cookies|;|→drawer_proj_backend_aaa",
+            ],
+            metadata={"wing": "project", "room": "backend", "source_file": "auth.py"},
         )
 
-        result = search_memories("JWT authentication", palace_path)
+        result = search_memories("JWT auth tokens expiry", palace_path)
         assert result["results"], "hybrid search should still return results"
         # The JWT-bearing drawer should surface with closet agreement.
         boosted = [h for h in result["results"] if h["matched_via"] == "drawer+closet"]
