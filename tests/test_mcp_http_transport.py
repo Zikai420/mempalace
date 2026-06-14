@@ -1,21 +1,92 @@
-import http.client
+import http.server
+import io
 import json
-import socket
 import sys
-import threading
-import time
 from typing import Optional
 
+import chromadb  # noqa: F401
 import pytest
 
-pytest.importorskip("chromadb")
-from mempalace import mcp_server  # noqa: E402
+from mempalace import mcp_server
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+class _FakeSocket:
+    def __init__(self, request_bytes: bytes):
+        self._read = io.BytesIO(request_bytes)
+        self._written = io.BytesIO()
+
+    def makefile(self, mode, buffering=None):
+        if "r" in mode:
+            return self._read
+        return self._written
+
+    def sendall(self, data: bytes):
+        self._written.write(data)
+
+    def close(self):
+        pass
+
+    def response_bytes(self) -> bytes:
+        return self._written.getvalue()
+
+
+def _capture_http_handler(monkeypatch):
+    captured = {}
+
+    class _FakeHTTPServer:
+        daemon_threads = True
+        allow_reuse_address = True
+
+        def __init__(self, server_address, handler_cls):
+            captured["server_address"] = server_address
+            captured["handler_cls"] = handler_cls
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def serve_forever(self, poll_interval=0.5):
+            captured["poll_interval"] = poll_interval
+
+    monkeypatch.setattr(http.server, "ThreadingHTTPServer", _FakeHTTPServer)
+
+    mcp_server._serve_http("127.0.0.1", 8765)
+
+    assert captured["server_address"] == ("127.0.0.1", 8765)
+    assert captured["poll_interval"] == 0.5
+    return captured["handler_cls"]
+
+
+def _run_raw_request(handler_cls, raw_request: bytes) -> bytes:
+    sock = _FakeSocket(raw_request)
+    handler_cls(sock, ("127.0.0.1", 12345), object())
+    return sock.response_bytes()
+
+
+def _build_request(
+    method: str,
+    path: str,
+    body: Optional[bytes] = None,
+    headers: Optional[dict] = None,
+) -> bytes:
+    body = body or b""
+    headers = dict(headers or {})
+    headers.setdefault("Host", "127.0.0.1")
+    headers.setdefault("Connection", "close")
+    headers.setdefault("Content-Length", str(len(body)))
+
+    head = [f"{method} {path} HTTP/1.1"]
+    head.extend(f"{key}: {value}" for key, value in headers.items())
+    return ("\r\n".join(head) + "\r\n\r\n").encode("ascii") + body
+
+
+def _parse_response(raw_response: bytes):
+    head, _, body = raw_response.partition(b"\r\n\r\n")
+    status_line = head.splitlines()[0].decode("iso-8859-1")
+    status = int(status_line.split()[1])
+    return status, body
 
 
 def _fake_dispatch(request):
@@ -58,94 +129,29 @@ def _fake_dispatch(request):
     }
 
 
-def _http_request(
-    port: int,
-    method: str,
-    path: str,
-    body: bytes | None = None,
-    headers: Optional[dict] = None,
-    timeout: float = 2.0,
-):
-    # Use http.client directly for loopback tests. urllib can honor proxy
-    # or macOS system proxy settings, which makes 127.0.0.1 readiness
-    # checks flaky in CI.
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
-    try:
-        conn.request(method, path, body=body, headers=headers or {})
-        resp = conn.getresponse()
-        data = resp.read()
-        return resp.status, data
-    finally:
-        conn.close()
+@pytest.fixture()
+def http_handler(monkeypatch):
+    monkeypatch.setattr(mcp_server, "handle_request", _fake_dispatch)
+    return _capture_http_handler(monkeypatch)
 
 
-def _wait_for_healthz(
-    port: int, thread: threading.Thread, errors: list, timeout: float = 20.0
-) -> None:
-    deadline = time.monotonic() + timeout
-    last_error = None
-
-    while time.monotonic() < deadline:
-        if errors:
-            raise AssertionError(f"HTTP server thread crashed: {errors!r}")
-
-        if not thread.is_alive():
-            raise AssertionError("HTTP server thread exited before /healthz became ready")
-
-        try:
-            status, body = _http_request(port, "GET", "/healthz", timeout=1.0)
-            if status == 200 and body == b"ok\n":
-                return
-        except (OSError, TimeoutError, http.client.HTTPException) as exc:
-            last_error = exc
-            time.sleep(0.1)
-
-    raise AssertionError(f"HTTP server did not become ready: {last_error!r}")
-
-
-@pytest.fixture(scope="module")
-def http_port():
-    original_handle_request = mcp_server.handle_request
-    mcp_server.handle_request = _fake_dispatch
-
-    port = _free_port()
-    errors = []
-
-    def _run_server():
-        try:
-            mcp_server._serve_http("127.0.0.1", port)
-        except BaseException as exc:  # pragma: no cover - diagnostic path
-            errors.append(repr(exc))
-
-    thread = threading.Thread(
-        target=_run_server,
-        name="test-mcp-http-transport",
-        daemon=True,
-    )
-    thread.start()
-
-    try:
-        _wait_for_healthz(port, thread, errors)
-        yield port
-    finally:
-        mcp_server.handle_request = original_handle_request
-
-
-def _rpc(port: int, method: str, params: Optional[dict] = None, req_id: int = 1):
+def _rpc(handler_cls, method: str, params: Optional[dict] = None, req_id: int = 1):
     payload = {
         "jsonrpc": "2.0",
         "id": req_id,
         "method": method,
         "params": params or {},
     }
-    status, body = _http_request(
-        port,
-        "POST",
-        "/mcp",
-        body=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        timeout=10.0,
+    raw = _run_raw_request(
+        handler_cls,
+        _build_request(
+            "POST",
+            "/mcp",
+            body=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        ),
     )
+    status, body = _parse_response(raw)
     return status, json.loads(body.decode("utf-8")) if body else None
 
 
@@ -181,16 +187,17 @@ def test_parse_args_accepts_http_transport(monkeypatch):
     assert args.port == 9999
 
 
-def test_http_transport_serves_healthz(http_port):
-    status, body = _http_request(http_port, "GET", "/healthz", timeout=10.0)
+def test_http_transport_serves_healthz(http_handler):
+    raw = _run_raw_request(http_handler, _build_request("GET", "/healthz"))
+    status, body = _parse_response(raw)
 
     assert status == 200
     assert body == b"ok\n"
 
 
-def test_http_transport_serves_initialize_ping_and_repeated_tools_list(http_port):
+def test_http_transport_serves_initialize_ping_and_repeated_tools_list(http_handler):
     status, initialized = _rpc(
-        http_port,
+        http_handler,
         "initialize",
         {"protocolVersion": "2025-11-25"},
         req_id=1,
@@ -198,11 +205,11 @@ def test_http_transport_serves_initialize_ping_and_repeated_tools_list(http_port
     assert status == 200
     assert initialized["result"]["protocolVersion"] == "2025-11-25"
 
-    status, ping = _rpc(http_port, "ping", {}, req_id=2)
+    status, ping = _rpc(http_handler, "ping", {}, req_id=2)
     assert status == 200
     assert ping["result"] == {}
 
-    status, first = _rpc(http_port, "tools/list", {}, req_id=3)
+    status, first = _rpc(http_handler, "tools/list", {}, req_id=3)
     assert status == 200
     tools = first["result"]["tools"]
     assert len(tools) == 128
@@ -211,21 +218,23 @@ def test_http_transport_serves_initialize_ping_and_repeated_tools_list(http_port
     # Regression shape for #1801: repeated large tools/list frames should
     # keep succeeding over HTTP without relying on stdio framing.
     for req_id in range(4, 12):
-        status, payload = _rpc(http_port, "tools/list", {}, req_id=req_id)
+        status, payload = _rpc(http_handler, "tools/list", {}, req_id=req_id)
         assert status == 200
         assert payload["id"] == req_id
         assert payload["result"]["tools"] == tools
 
 
-def test_http_transport_returns_parse_error_for_invalid_json(http_port):
-    status, body = _http_request(
-        http_port,
-        "POST",
-        "/mcp",
-        body=b"not-json",
-        headers={"Content-Type": "application/json"},
-        timeout=10.0,
+def test_http_transport_returns_parse_error_for_invalid_json(http_handler):
+    raw = _run_raw_request(
+        http_handler,
+        _build_request(
+            "POST",
+            "/mcp",
+            body=b"not-json",
+            headers={"Content-Type": "application/json"},
+        ),
     )
+    status, body = _parse_response(raw)
     payload = json.loads(body.decode("utf-8"))
 
     assert status == 400
@@ -233,33 +242,37 @@ def test_http_transport_returns_parse_error_for_invalid_json(http_port):
     assert payload["error"]["message"] == "Parse error"
 
 
-def test_http_transport_accepts_notifications_without_body(http_port):
+def test_http_transport_accepts_notifications_without_body(http_handler):
     payload = {
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
         "params": {},
     }
-    status, body = _http_request(
-        http_port,
-        "POST",
-        "/mcp",
-        body=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        timeout=10.0,
+    raw = _run_raw_request(
+        http_handler,
+        _build_request(
+            "POST",
+            "/mcp",
+            body=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        ),
     )
+    status, body = _parse_response(raw)
 
     assert status == 202
     assert body == b""
 
 
-def test_http_transport_returns_404_for_unknown_path(http_port):
-    status, _body = _http_request(
-        http_port,
-        "POST",
-        "/not-mcp",
-        body=b"{}",
-        headers={"Content-Type": "application/json"},
-        timeout=10.0,
+def test_http_transport_returns_404_for_unknown_path(http_handler):
+    raw = _run_raw_request(
+        http_handler,
+        _build_request(
+            "POST",
+            "/not-mcp",
+            body=b"{}",
+            headers={"Content-Type": "application/json"},
+        ),
     )
+    status, _body = _parse_response(raw)
 
     assert status == 404
