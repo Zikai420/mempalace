@@ -22,6 +22,7 @@ HOOK_CONFIG = REPO_ROOT / ".claude-plugin" / "hooks" / "hooks.json"
 EVENT_TIMEOUT_BOUNDS: dict[str, tuple[int, int]] = {
     "Stop": (10, 30),
     "PreCompact": (60, 90),
+    "SessionEnd": (60, 90),
 }
 
 
@@ -86,3 +87,19 @@ def test_no_unbounded_events_in_plugin_config(hook_config: dict) -> None:
         "Add a (floor, ceiling) entry to EVENT_TIMEOUT_BOUNDS in this test "
         "after deciding the worst-case freeze the event can tolerate."
     )
+
+
+def test_session_end_hook_runs_precompact_mine(hook_config: dict) -> None:
+    """Claude SessionEnd should perform the same deterministic mine as PreCompact."""
+    events = hook_config.get("hooks", {})
+
+    assert "SessionEnd" in events
+    assert events["SessionEnd"] == events["PreCompact"]
+
+    commands = [
+        hook["command"]
+        for entry in events["SessionEnd"]
+        for hook in entry.get("hooks", [])
+        if hook.get("type") == "command"
+    ]
+    assert any("mempal-precompact-hook.sh" in command for command in commands)
