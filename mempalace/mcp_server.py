@@ -323,6 +323,9 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         return True, _MCP_WRITER_LOCK_ERROR
 
     _MCP_WRITER_LOCK_CM = lock_cm
+    import atexit
+
+    atexit.register(lambda: lock_cm.__exit__(None, None, None))
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
@@ -366,7 +369,7 @@ def _refresh_sqlite_integrity_status() -> None:
     global _sqlite_integrity_errors
     global _sqlite_integrity_check_error
 
-    if not _is_chroma_backend():
+    if not _config.palace_path or not _is_chroma_backend():
         _sqlite_integrity_checked = True
         _sqlite_integrity_errors = []
         _sqlite_integrity_check_error = ""
@@ -407,7 +410,9 @@ def _sqlite_integrity_payload() -> dict:
         "checked": _sqlite_integrity_checked,
         "ok": not _sqlite_integrity_errors,
         "palace": _config.palace_path,
-        "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3"),
+        "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3")
+        if _config.palace_path
+        else "",
         "error_count": len(_sqlite_integrity_errors),
         "errors": _sqlite_integrity_errors[:10],
     }
