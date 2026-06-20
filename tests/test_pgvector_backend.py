@@ -24,6 +24,7 @@ from mempalace.backends.pgvector import (
     _vector_distance,
     _as_vector_array,
     _strip_nul,
+    _json_dumps,
 )
 
 
@@ -655,6 +656,56 @@ def test_client_execute_after_close_raises(monkeypatch):
     assert len(created) == 1
 
 
+class _FakeUpsertCursor:
+    """Captures the params bound by ``upsert_rows`` -> ``_execute(many=True)``."""
+
+    def __init__(self, captured):
+        self._captured = captured
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        return None
+
+    def executemany(self, sql, params=None):
+        self._captured.extend(params or [])
+
+    def fetchall(self):
+        return []
+
+
+class _FakeUpsertConn:
+    def __init__(self, captured):
+        self._captured = captured
+
+    def cursor(self):
+        return _FakeUpsertCursor(self._captured)
+
+    def commit(self):
+        return None
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+
+def _fake_upsert_client(monkeypatch):
+    """Install a fake psycopg whose connection captures bound params, and return
+    ``(client, captured)`` for driving the real ``upsert_rows`` write path."""
+    captured = []
+    fake_psycopg = types.ModuleType("psycopg")
+    fake_psycopg.connect = lambda *args, **kwargs: _FakeUpsertConn(captured)
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    return client, captured
+
+
 def test_pgvector_upsert_strips_nul_bytes(monkeypatch):
     """A NUL (0x00) byte in id/document/metadata must never reach Postgres.
 
@@ -665,42 +716,7 @@ def test_pgvector_upsert_strips_nul_bytes(monkeypatch):
     same inputs ingestible. Strip, not reject: rejecting would re-abort the
     mine or drop the drawer entirely (recall loss).
     """
-    captured = []
-
-    class _FakeCursor:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def execute(self, sql, params=None):
-            return None
-
-        def executemany(self, sql, params=None):
-            captured.extend(params or [])
-
-        def fetchall(self):
-            return []
-
-    class _FakeConn:
-        def cursor(self):
-            return _FakeCursor()
-
-        def commit(self):
-            return None
-
-        def rollback(self):
-            return None
-
-        def close(self):
-            return None
-
-    fake_psycopg = types.ModuleType("psycopg")
-    fake_psycopg.connect = lambda _dsn: _FakeConn()
-    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
-
-    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    client, captured = _fake_upsert_client(monkeypatch)
     client.upsert_rows(
         "drawers",
         [
@@ -749,3 +765,102 @@ def test_strip_nul_helper():
     assert _strip_nul(3.5) == 3.5
     assert _strip_nul(True) is True
     assert _strip_nul(None) is None
+
+
+def test_pgvector_upsert_replaces_lone_surrogates(monkeypatch):
+    """A lone UTF-16 surrogate in id/document/metadata must never reach Postgres.
+
+    psycopg encodes text/jsonb parameters as UTF-8, and a lone surrogate has no
+    UTF-8 encoding, so it raises UnicodeEncodeError ("surrogates not allowed") and
+    aborts the entire mine run (the surrogate sibling of the NUL abort in #1829).
+    ChromaDB sanitizes document text via config.strip_lone_surrogates;
+    pgvector matches it (for document and metadata) by replacing the surrogate with
+    U+FFFD rather than dropping the drawer (recall loss) or re-aborting the mine.
+    """
+    # Build the surrogates with chr() so this source file stays valid UTF-8 (a raw
+    # lone surrogate has no UTF-8 encoding and would not parse).
+    hi, lo, s3, s4, s5 = (chr(c) for c in (0xD800, 0xDFFF, 0xD834, 0xDCA1, 0xDC00))
+    repl = chr(0xFFFD)
+    client, captured = _fake_upsert_client(monkeypatch)
+    client.upsert_rows(
+        "drawers",
+        [
+            {
+                "id": f"draw{hi}er",
+                "document": f"before{lo}after",
+                "metadata": {f"go{s3}od": f"v{s4}w", "nested": [f"a{s5}b", 7]},
+                "embedding": [1.0, 0.0],
+                "updated_at": "2026-06-20T00:00:00Z",
+            }
+        ],
+    )
+
+    assert len(captured) == 1, "upsert_rows should bind exactly one row"
+    row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
+
+    # Every text-bound parameter must now be UTF-8 encodable (what psycopg does to
+    # bind it); a surviving lone surrogate would raise here.
+    for field in (row_id, document, metadata_json):
+        field.encode("utf-8")
+
+    # Surrogates are replaced with U+FFFD, not dropped: surrounding content stays
+    # and each lone surrogate maps to exactly one replacement character.
+    assert row_id == f"draw{repl}er"
+    assert document == f"before{repl}after"
+    assert json.loads(metadata_json) == {f"go{repl}od": f"v{repl}w", "nested": [f"a{repl}b", 7]}
+
+
+def test_pgvector_upsert_strips_nul_and_surrogate_together(monkeypatch):
+    """A single row carrying *both* a NUL and a lone surrogate must come out
+    clean on every text-bound field.
+
+    This pins the composition of the two sibling fixes (#1829 NUL, #1833
+    surrogate), which edit the same ``upsert_rows`` binding: NUL is stripped
+    pre-serialization and the surrogate replaced post-serialization. A rebase
+    that kept only one strip would regress the other byte class silently, since
+    neither sibling test exercises both at once.
+    """
+    sur = chr(0xD800)
+    repl = chr(0xFFFD)
+    client, captured = _fake_upsert_client(monkeypatch)
+    client.upsert_rows(
+        "drawers",
+        [
+            {
+                "id": f"id\x00{sur}x",
+                "document": f"doc\x00{sur}y",
+                "metadata": {f"k\x00{sur}": f"v\x00{sur}", "nested": [f"a\x00{sur}b", 7]},
+                "embedding": [1.0, 0.0],
+                "updated_at": "2026-06-20T00:00:00Z",
+            }
+        ],
+    )
+
+    assert len(captured) == 1, "upsert_rows should bind exactly one row"
+    row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
+
+    # Neither unstorable byte survives, and each bound field is UTF-8 encodable.
+    for field in (row_id, document, metadata_json):
+        assert "\x00" not in field
+        assert sur not in field
+        field.encode("utf-8")
+
+    # NUL dropped, surrogate -> U+FFFD, surrounding content preserved.
+    assert row_id == f"id{repl}x"
+    assert document == f"doc{repl}y"
+    assert json.loads(metadata_json) == {f"k{repl}": f"v{repl}", "nested": [f"a{repl}b", 7]}
+
+
+def test_strip_lone_surrogates_reuses_config_util():
+    """The pgvector write path strips surrogates via ``config.strip_lone_surrogates``
+    applied to id/document and the serialized metadata JSON (no pgvector-local
+    helper). End-to-end coverage is ``test_pgvector_upsert_replaces_lone_surrogates``;
+    the utility's own edge cases live in ``tests/test_clean_lone_surrogates.py``."""
+    from mempalace.config import strip_lone_surrogates
+
+    # ensure_ascii=False leaves a metadata surrogate raw in the JSON, so a single
+    # pass over the serialized string cleans it (the property the write path relies on).
+    raw = _json_dumps({"k": f"v{chr(0xD800)}w"})
+    cleaned = strip_lone_surrogates(raw)
+    assert chr(0xD800) not in cleaned
+    assert json.loads(cleaned) == {"k": f"v{chr(0xFFFD)}w"}

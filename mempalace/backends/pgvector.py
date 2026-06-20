@@ -37,6 +37,7 @@ from urllib import parse as urlparse
 
 import numpy as np
 
+from ..config import strip_lone_surrogates
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
@@ -617,12 +618,21 @@ class _PgVectorClient:
         )
         params = [
             (
-                # Strip NUL from every text-bound field so none can abort the
-                # insert. ids are generated NUL-free hashes, so for real rows the
-                # id strip is a no-op (it never rewrites the ON CONFLICT key).
-                _strip_nul(row["id"]),
-                _strip_nul(row["document"]),
-                _json_dumps(_strip_nul(row.get("metadata"))),
+                # Strip both unstorable byte classes Postgres rejects before
+                # binding, so one stray byte in a transcript cannot abort the
+                # whole mine (#1829 NUL, #1833 lone surrogate).
+                #
+                # Order matters for metadata: NUL must be stripped *before*
+                # serialization (json escapes it to \\u0000, which the jsonb cast
+                # rejects), while a lone surrogate must be stripped *after*
+                # serialization (json.dumps(ensure_ascii=False) leaves it raw, so
+                # one pass over the serialized string cleans it without walking
+                # the dict). id/document are plain strings, so the two passes
+                # commute there. ids are NUL- and surrogate-free in practice, so
+                # those passes are defensive no-ops on the ON CONFLICT key.
+                strip_lone_surrogates(_strip_nul(row["id"])),
+                strip_lone_surrogates(_strip_nul(row["document"])),
+                strip_lone_surrogates(_json_dumps(_strip_nul(row.get("metadata")))),
                 _vector_literal(row["embedding"]),
                 row.get("updated_at") or _utcnow(),
             )
