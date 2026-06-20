@@ -897,6 +897,49 @@ class TestReadTools:
         assert status["wings"] == {"unknown": 1}
         assert status["rooms"] == {"unknown": 1}
 
+    def test_graph_stats_uses_sqlite_fast_path(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """graph_stats must aggregate from sqlite without paging metadata
+        through build_graph()/HNSW (#1379). Mirrors the build_graph parity
+        case in test_palace_graph; the tripwire on graph_stats fails loudly if
+        the fast path regresses to the slow client build."""
+        collection.add(
+            ids=["d_db_code", "d_db_proj", "d_auth", "d_general", "d_orphan"],
+            documents=[
+                "chromadb setup in the code wing",
+                "chromadb usage in the project wing",
+                "auth and security notes",
+                "a general catch-all drawer",
+                "a drawer with no wing",
+            ],
+            metadatas=[
+                {"room": "chromadb", "wing": "wing_code", "hall": "db"},
+                {"room": "chromadb", "wing": "wing_project", "hall": "db"},
+                {"room": "auth", "wing": "wing_code", "hall": "security"},
+                {"room": "general", "wing": "wing_code", "hall": "misc"},
+                {"room": "orphan", "source_file": "loose.txt"},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        def _boom(*_a, **_k):
+            raise AssertionError("build_graph client path used instead of sqlite fast path")
+
+        monkeypatch.setattr(mcp_server, "graph_stats", _boom)
+
+        stats = mcp_server.tool_graph_stats()
+        # "general" room and the wing-less drawer are excluded, matching
+        # build_graph's per-drawer filter.
+        assert stats["total_rooms"] == 2
+        assert stats["tunnel_rooms"] == 1
+        assert stats["total_edges"] == 1
+        assert stats["rooms_per_wing"] == {"wing_code": 2, "wing_project": 1}
+        assert stats["top_tunnels"] == [
+            {"room": "chromadb", "wings": ["wing_code", "wing_project"], "count": 2}
+        ]
+
     def test_no_palace_returns_error(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status

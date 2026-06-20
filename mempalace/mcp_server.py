@@ -1014,6 +1014,116 @@ def _sqlite_taxonomy():
     return total, normalized
 
 
+def _sqlite_graph_stats():
+    """Compute ``graph_stats`` from one grouped sqlite read (#1379, graph_stats
+    half; follow-up to #1748).
+
+    ``graph_stats`` only needs grouped counts, but the client path builds the
+    whole graph by paging every metadata row (``build_graph`` →
+    ``col.get(limit, offset)``) and cold-loads the HNSW index — which times out
+    on six-figure palaces. This reads the same wing/room/hall grouping straight
+    from ``chroma.sqlite3`` and reconstructs the stats.
+
+    Returns the stats dict, or ``None`` to fall back to the client path
+    (non-chroma backend, missing/unbootstrapped palace, sqlite error). The
+    reconstruction mirrors ``palace_graph.build_graph`` /
+    ``palace_graph.graph_stats`` exactly: a node is a room with a non-empty
+    wing and a usable room name (the catch-all ``"general"`` is excluded), and
+    edges are the per-hall cross-wing crossings of multi-wing rooms.
+    """
+    if not _is_chroma_backend():
+        return None
+    import sqlite3 as _sqlite3
+    from collections import Counter, defaultdict
+
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    collection_name = _config.collection_name
+    try:
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            rows = conn.execute(
+                """
+                SELECT
+                    COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
+                             CAST(rm.float_value AS TEXT), '') AS room,
+                    COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
+                             CAST(wm.float_value AS TEXT), '') AS wing,
+                    COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
+                             CAST(hm.float_value AS TEXT), '') AS hall,
+                    COUNT(*) AS n
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
+                LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
+                WHERE c.name = ?
+                GROUP BY room, wing, hall
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except _sqlite3.Error:
+        logger.debug("sqlite graph_stats fast path failed; falling back", exc_info=True)
+        return None
+
+    # Reconstruct build_graph()'s room_data, applying its per-drawer filter
+    # (`if room and room != "general" and wing`).
+    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
+    for room, wing, hall, n in rows:
+        if not room or room == "general" or not wing:
+            continue
+        node = room_data[room]
+        node["wings"].add(wing)
+        if hall:
+            node["halls"].add(hall)
+        node["count"] += int(n)
+
+    tunnel_rooms = 0
+    total_edges = 0
+    wing_counts = Counter()
+    for data in room_data.values():
+        n_wings = len(data["wings"])
+        for wing in data["wings"]:
+            wing_counts[wing] += 1
+        if n_wings >= 2:
+            tunnel_rooms += 1
+            # Edges per multi-wing room: one per wing-pair per hall, matching
+            # build_graph's nested wa<wb × hall expansion.
+            total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
+
+    top_tunnels = [
+        {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
+        # build_graph's graph_stats slices the top 10 by wing-count first, then
+        # keeps the multi-wing ones. Secondary sort by room name keeps the
+        # fast-path order deterministic (the client path's tie order follows
+        # dict-insertion order, which sqlite grouping can't reproduce).
+        for room, data in sorted(room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0]))[
+            :10
+        ]
+        if len(data["wings"]) >= 2
+    ]
+
+    return {
+        "total_rooms": len(room_data),
+        "tunnel_rooms": tunnel_rooms,
+        "total_edges": total_edges,
+        "rooms_per_wing": dict(wing_counts.most_common()),
+        "top_tunnels": top_tunnels,
+    }
+
+
 def tool_status():
     # Run the safe sqlite/pickle probe before we touch chromadb. In the
     # #1222 failure mode, opening the persistent client to call .count()
@@ -1355,6 +1465,12 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
 
 def tool_graph_stats():
     """Palace graph overview: nodes, tunnels, edges, connectivity."""
+    # Fast path: grouped sqlite read instead of paging all metadata and
+    # cold-loading HNSW via build_graph(), which times out on large palaces
+    # (#1379). Falls through to the client path for non-chroma backends.
+    fast = _sqlite_graph_stats()
+    if fast is not None:
+        return fast
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
