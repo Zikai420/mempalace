@@ -1105,6 +1105,91 @@ class TestSearchTool:
         result = tool_search(query="database", room="backend")
         assert all(r["room"] == "backend" for r in result["results"])
 
+    def test_search_with_source_file_filter(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="authentication module", source_file="auth.py")
+        assert result["results"]
+        assert all(r["source_file"] == "auth.py" for r in result["results"])
+        assert result["filters"]["source_file"] == "auth.py"
+
+    def test_search_source_file_allows_path_separators(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Unlike wing/room, a source_file is a path — '/' must NOT be rejected
+        # as a path-traversal attempt the way sanitize_name() would.
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="authentication", source_file="/abs/path/to/auth.py")
+        assert "error" not in result
+
+    def test_search_blank_source_file_ignored(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT authentication", source_file="   ")
+        assert "results" in result
+        assert result["filters"]["source_file"] is None
+
+    def test_search_rejects_null_byte_source_file(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # A null byte in a metadata where-value can crash chromadb add/upsert
+        # (#1235 lineage); reject it cleanly the way sanitize_name does.
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT", source_file="bad\x00null")
+        assert "error" in result
+
+    def test_search_rejects_overlong_source_file(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT", source_file="x" * 5000)
+        assert "error" in result
+
+    def test_search_rejects_non_string_source_file(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # A non-string source_file (e.g. a JSON number, which the schema's
+        # string type does not coerce) must yield a clean validation error,
+        # not an unhandled AttributeError from .strip().
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT", source_file=42)
+        assert "error" in result
+
+    def test_search_rejects_lone_surrogate_source_file(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # A lone UTF-16 surrogate can crash chromadb (#1235); reject it for
+        # parity with sanitize_name rather than letting it reach the backend.
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT", source_file="bad\udc80surrogate")
+        assert "error" in result
+
+    def test_search_accepts_source_file_at_length_boundary(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Exactly _MAX_SOURCE_FILE_LENGTH is allowed (the cap is a strict '>').
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import _MAX_SOURCE_FILE_LENGTH, tool_search
+
+        result = tool_search(query="JWT", source_file="x" * _MAX_SOURCE_FILE_LENGTH)
+        assert "error" not in result
+
     def test_search_min_similarity_backwards_compat(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):

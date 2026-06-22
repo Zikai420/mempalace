@@ -9,7 +9,7 @@ Tools (read):
   mempalace_list_wings      — all wings with drawer counts
   mempalace_list_rooms      — rooms within a wing
   mempalace_get_taxonomy    — full wing → room → count tree
-  mempalace_search          — semantic search, optional wing/room filter
+  mempalace_search          — semantic search, optional wing/room/source_file filter
   mempalace_check_duplicate — check if content already exists before filing
 
 Tools (write):
@@ -1152,6 +1152,41 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     return sanitize_name(value, field_name)
 
 
+# Bounds the whole stored source_file string (often an absolute path), so it is
+# Linux PATH_MAX rather than the 128-char wing/room NAME limit.
+_MAX_SOURCE_FILE_LENGTH = 4096
+
+
+def _sanitize_optional_source_file(value: str = None) -> str:
+    """Validate an optional source_file search filter (#1815).
+
+    Unlike wing/room, a source_file is a path: ``/``, ``\\`` and ``.`` are
+    legal, so it is NOT run through ``sanitize_name`` (which rejects path
+    characters as traversal attempts). The value is matched verbatim as a
+    ChromaDB metadata-equality / parameterized-SQL value — never used as a
+    filesystem path — so there is no traversal risk to guard against. A null
+    byte or a pathological length can still upset the backend (chromadb
+    add/upsert chokes on null bytes / lone surrogates, #1235), so guard those
+    for parity with ``sanitize_name``. Blank / whitespace-only is "no filter".
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("source_file must be a string")
+    value = value.strip()
+    if not value:
+        return None
+    if "\x00" in value:
+        raise ValueError("source_file contains null bytes")
+    if value != strip_lone_surrogates(value):
+        raise ValueError("source_file contains invalid surrogate characters")
+    if len(value) > _MAX_SOURCE_FILE_LENGTH:
+        raise ValueError(
+            f"source_file exceeds maximum length of {_MAX_SOURCE_FILE_LENGTH} characters"
+        )
+    return value
+
+
 # ==================== READ TOOLS ====================
 
 
@@ -1590,6 +1625,7 @@ def tool_search(
     limit: int = 5,
     wing: str = None,
     room: str = None,
+    source_file: str = None,
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
@@ -1598,6 +1634,7 @@ def tool_search(
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
+        source_file = _sanitize_optional_source_file(source_file)
     except ValueError as e:
         return {"error": str(e)}
     # Backwards compat: accept old name
@@ -1616,6 +1653,7 @@ def tool_search(
         palace_path=_config.palace_path,
         wing=wing,
         room=room,
+        source_file=source_file,
         n_results=limit,
         max_distance=dist,
         vector_disabled=_vector_disabled,
@@ -1633,6 +1671,7 @@ def tool_search(
             palace_path=_config.palace_path,
             wing=wing,
             room=room,
+            source_file=source_file,
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
@@ -3483,6 +3522,15 @@ TOOLS = {
                 },
                 "wing": {"type": "string", "description": "Filter by wing (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "source_file": {
+                    "type": "string",
+                    "description": (
+                        "Filter to one exact source_file (optional). Matches the full "
+                        "stored path exactly (leading/trailing whitespace trimmed); no "
+                        "glob or basename matching. Pass the value from a result's "
+                        "'source_path' field; the displayed 'source_file' is only a basename."
+                    ),
+                },
                 "max_distance": {
                     "type": "number",
                     "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
