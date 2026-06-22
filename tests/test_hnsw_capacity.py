@@ -588,7 +588,9 @@ def test_bm25_fallback_handles_short_query(palace_with_drawers):
 
 
 def test_repair_status_reports_diverged(tmp_path, capsys):
-    """The status command prints DIVERGED and recommends rebuild."""
+    """The status command prints DIVERGED and recommends the from-sqlite
+    rebuild (not a re-mine), since a diverged index means the rows are
+    intact in sqlite but the HNSW segment is out of sync (#1843)."""
     from mempalace.repair import status as repair_status
 
     seg = "seg-status"
@@ -597,7 +599,8 @@ def test_repair_status_reports_diverged(tmp_path, capsys):
     out = repair_status(palace_path=str(tmp_path))
     captured = capsys.readouterr().out
     assert "DIVERGED" in captured
-    assert "mempalace repair`" in captured
+    assert "mempalace repair --mode from-sqlite --archive-existing" in captured
+    assert "Do not re-mine" in captured
     assert out["drawers"]["diverged"] is True
 
 

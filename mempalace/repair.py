@@ -1309,7 +1309,15 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
             print(f"    note:           {info['message']}")
 
     if drawers["diverged"] or closets["diverged"]:
-        print("\n  Recommended: run `mempalace repair` to rebuild the index.")
+        print(
+            "\n  Recommended: rebuild the index from SQLite rather than re-mining:\n"
+            "\n      mempalace repair --mode from-sqlite --archive-existing\n"
+            "\n  A diverged index usually means the HNSW segment is out of sync with\n"
+            "  chroma.sqlite3 (for example a failed chromadb HNSW compaction). The\n"
+            "  drawer rows are intact in SQLite, so --mode from-sqlite recovers them.\n"
+            "  Do not re-mine from source files: that would drop drawers added via\n"
+            "  the MCP server and diary entries, which have no source file (#1843)."
+        )
     print()
     return {"drawers": drawers, "closets": closets}
 
