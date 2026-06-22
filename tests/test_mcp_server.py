@@ -3934,3 +3934,264 @@ class TestUnknownParamName:
         )
         assert "error" not in resp
         assert "result" in resp
+
+
+def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
+    from mempalace import mcp_server
+
+    called = {"value": False}
+
+    def handler(**kwargs):
+        called["value"] = True
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_add_drawer",
+        {
+            "description": "test write tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "wing": {"type": "string"},
+                    "room": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+            "handler": handler,
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_acquire_mcp_writer_lock",
+        lambda: (False, "busy writer"),
+    )
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_add_drawer",
+                "arguments": {
+                    "wing": "wing_test",
+                    "room": "room_test",
+                    "content": "hello",
+                },
+            },
+        }
+    )
+
+    assert called["value"] is False
+    assert response["error"]["code"] == -32001
+    assert "read-only" in response["error"]["message"]
+    assert response["error"]["data"]["tool"] == "mempalace_add_drawer"
+
+
+def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
+    from mempalace import mcp_server
+
+    def forbidden_lock():
+        raise AssertionError("read tools should not acquire the peer-writer lock")
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_status",
+        {
+            "description": "test read tool",
+            "input_schema": {"type": "object", "properties": {}},
+            "handler": lambda: {"ok": True},
+        },
+    )
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {"name": "mempalace_status", "arguments": {}},
+        }
+    )
+
+    assert '"ok": true' in response["result"]["content"][0]["text"]
+
+
+def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
+    from mempalace import mcp_server, palace
+
+    calls = {"count": 0}
+
+    def broken_mine_palace_lock(palace_path):
+        calls["count"] += 1
+        raise RuntimeError(f"permission denied for {palace_path}")
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(palace, "mine_palace_lock", broken_mine_palace_lock)
+
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    ok_first, reason_first = mcp_server._acquire_mcp_writer_lock()
+    ok_second, reason_second = mcp_server._acquire_mcp_writer_lock()
+
+    assert ok_first is True
+    assert ok_second is True
+    assert calls["count"] == 1
+    assert mcp_server._MCP_WRITER_LOCK_FAILED is True
+    assert "continuing without peer-writer protection" in reason_first
+    assert reason_second == reason_first
+
+
+def test_sqlite_integrity_gate_refuses_non_status_tool(monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_errors",
+        ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1818,
+            "method": "tools/call",
+            "params": {"name": "mempalace_list_wings", "arguments": {}},
+        }
+    )
+
+    assert response["error"]["code"] == mcp_server._SQLITE_INTEGRITY_ERROR_CODE
+    assert "integrity check failed" in response["error"]["message"]
+    assert response["error"]["data"]["tool"] == "mempalace_list_wings"
+    assert "malformed inverted index" in response["error"]["data"]["errors"][0]
+
+
+def test_sqlite_integrity_status_surfaces_payload_without_chroma(monkeypatch):
+    import json
+
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_errors",
+        ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(
+        mcp_server,
+        "_tool_status_via_sqlite",
+        lambda: {"total_drawers": 123, "backend": "chroma"},
+    )
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1819,
+            "method": "tools/call",
+            "params": {"name": "mempalace_status", "arguments": {}},
+        }
+    )
+
+    payload = json.loads(response["result"]["content"][0]["text"])
+
+    assert payload["total_drawers"] == 123
+    assert payload["sqlite_integrity_failed"] is True
+    assert payload["sqlite_integrity"]["ok"] is False
+    assert payload["sqlite_integrity"]["error_count"] == 1
+    assert "malformed inverted index" in payload["sqlite_integrity"]["errors"][0]
+
+
+def test_sqlite_integrity_reconnect_allowed_when_corrupt(monkeypatch):
+    from mempalace import mcp_server
+
+    called = {"value": False}
+
+    def fake_reconnect():
+        called["value"] = True
+        return {"success": True}
+
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_errors",
+        ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_reconnect",
+        {
+            "description": "test reconnect",
+            "input_schema": {"type": "object", "properties": {}},
+            "handler": fake_reconnect,
+        },
+    )
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1820,
+            "method": "tools/call",
+            "params": {"name": "mempalace_reconnect", "arguments": {}},
+        }
+    )
+
+    assert called["value"] is True
+    assert '"success": true' in response["result"]["content"][0]["text"]
+
+
+def test_refresh_sqlite_integrity_status_records_quick_check_errors(monkeypatch):
+    from mempalace import mcp_server, repair
+
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        repair,
+        "sqlite_integrity_errors",
+        lambda palace_path: [
+            "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+        ],
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert mcp_server._sqlite_integrity_checked is True
+    assert len(mcp_server._sqlite_integrity_errors) == 1
+    assert "malformed inverted index" in mcp_server._sqlite_integrity_errors[0]
+
+
+def test_sqlite_integrity_refusal_handles_none_palace_path(monkeypatch):
+    """
+    Regression test for Gemini review feedback on PR #1823 (lines 433-455).
+
+    _mcp_sqlite_integrity_refusal() must not raise TypeError when
+    _config.palace_path is None — os.path.join(None, "chroma.sqlite3")
+    would otherwise crash the server on every mutating tool call while
+    the palace is unconfigured and integrity errors are present.
+    """
+    from mempalace import mcp_server
+
+    # palace_path is a read-only @property on MempalaceConfig (no setter),
+    # so monkeypatch.setattr on the instance fails. Patch the class-level
+    # property instead -- monkeypatch restores it automatically on teardown.
+    monkeypatch.setattr(type(mcp_server._config), "palace_path", property(lambda self: None))
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", ["malformed inverted index"])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    # Must not raise
+    result = mcp_server._mcp_sqlite_integrity_refusal(req_id=1, tool_name="mempalace_kg_add")
+
+    assert result is not None
+    assert result["error"]["data"]["palace"] == ""
+    assert result["error"]["data"]["sqlite_path"] == ""
+    assert result["error"]["data"]["tool"] == "mempalace_kg_add"
